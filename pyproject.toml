@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taobao-assistant-v2"
+version = "0.2.0"
+description = "淘宝扫码登录与人工确认辅助购买工具"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "flet==0.27.6",
+]
+
+[project.scripts]
+taobao-assistant = "src.cli:main"
+
+[tool.setuptools]
+packages = ["src"]
+

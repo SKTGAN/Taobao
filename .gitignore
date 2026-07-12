@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.idea/
+.vscode/
+
+# 本地运行数据：可能包含账号备注、任务记录和浏览器登录状态
+data/
+artifacts/
+exports/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# 本地凭据和浏览器资料
+config/*.yaml
+profiles/
+
+# 打包输出
+build/
+dist/
+*.exe
+
