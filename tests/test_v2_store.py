@@ -39,10 +39,52 @@ class V2StoreTests(unittest.TestCase):
         self.assertEqual(task["account_name"], "账号A")
         self.assertEqual(task["product_name"], "测试商品")
         self.assertEqual(task["mode"], "人工确认")
+        self.assertEqual(task["authorized_at"], "")
+
+    def test_authorize_and_reset_task(self) -> None:
+        account_id = self.store.add_account("账号A")
+        product_id = self.store.add_product("商品A", "https://item.taobao.com/item.htm?id=1")
+        task_id = self.store.add_task("任务A", account_id, product_id, "2026-07-13T20:00:00")
+        self.store.authorize_task(task_id)
+        task = self.store.list_tasks()[0]
+        self.assertEqual(task["status"], "已武装")
+        self.assertTrue(task["authorized_at"])
+        self.store.clear_task_authorization(task_id, "预检中")
+        task = self.store.list_tasks()[0]
+        self.assertEqual(task["status"], "预检中")
+        self.assertEqual(task["authorized_at"], "")
+
+    def test_updates_task_schedule_before_authorization(self) -> None:
+        account_id = self.store.add_account("账号A")
+        product_id = self.store.add_product("商品A", "https://item.taobao.com/item.htm?id=1")
+        task_id = self.store.add_task("任务A", account_id, product_id, "2026-07-13T20:00:00")
+        self.store.set_task_schedule(task_id, "2026-07-13T20:00:00.125")
+        self.assertEqual(self.store.get_task(task_id)["scheduled_at"], "2026-07-13T20:00:00.125")
+
+    def test_restart_requires_fresh_authorization(self) -> None:
+        account_id = self.store.add_account("账号A")
+        product_id = self.store.add_product("商品A", "https://item.taobao.com/item.htm?id=1")
+        task_id = self.store.add_task("任务A", account_id, product_id, "2026-07-13T20:00:00")
+        self.store.authorize_task(task_id)
+        reopened = V2Store(self.store.db_path)
+        task = reopened.get_task(task_id)
+        self.assertEqual(task["status"], "需重新准备")
+        self.assertEqual(task["authorized_at"], "")
 
     def test_rejects_unrelated_product_url(self) -> None:
         with self.assertRaises(ValueError):
             self.store.add_product("错误链接", "https://example.com/item")
+
+    def test_stores_canonical_product_url(self) -> None:
+        product_id = self.store.add_product(
+            "测试商品",
+            "https://item.taobao.com/item.htm?abbucket=11&id=987250846319&spm=test",
+        )
+        product = self.store.get_product(product_id)
+        self.assertEqual(
+            product["url"],
+            "https://item.taobao.com/item.htm?id=987250846319",
+        )
 
 
 if __name__ == "__main__":

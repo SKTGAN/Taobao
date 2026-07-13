@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="taobao-assistant-page" content="confirm_order">
+  <title>确认订单</title>
+</head>
+<body>
+  <h1>确认订单</h1>
+  <p>模拟地址与价格已核对</p>
+  <div id="checkout-host"></div>
+  <script>
+    const root = document.querySelector('#checkout-host').attachShadow({mode: 'open'});
+    root.innerHTML = '<button id="submit" disabled>提交订单</button>';
+    setTimeout(() => {
+      const button = root.querySelector('#submit');
+      button.disabled = false;
+      button.addEventListener('click', () => { window.open('/pending.html', '_blank'); });
+    }, 500);
+  </script>
+</body>
+</html>

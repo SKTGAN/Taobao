@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from src.product_urls import normalize_product_url
+
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -41,6 +43,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     scheduled_at TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT '草稿',
     mode TEXT NOT NULL DEFAULT '人工确认',
+    authorized_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    triggered_at TEXT NOT NULL DEFAULT '',
+    completed_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -69,10 +76,31 @@ class V2Store:
         with closing(self.connect()) as connection:
             with connection:
                 connection.executescript(SCHEMA)
+                self._migrate_tasks(connection)
                 connection.execute(
                     "UPDATE accounts SET status='未登录',updated_at=? WHERE status IN ('启动中','检查中')",
                     (now_iso(),),
                 )
+                connection.execute(
+                    """UPDATE tasks SET status='需重新准备',authorized_at='',
+                       last_error='程序重启后需重新预检并授权',updated_at=?
+                       WHERE status IN ('已武装','等待中','触发中','提交中')""",
+                    (now_iso(),),
+                )
+
+    @staticmethod
+    def _migrate_tasks(connection: sqlite3.Connection) -> None:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(tasks)")}
+        additions = {
+            "authorized_at": "TEXT NOT NULL DEFAULT ''",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "triggered_at": "TEXT NOT NULL DEFAULT ''",
+            "completed_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {declaration}")
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=10)
@@ -125,8 +153,7 @@ class V2Store:
         name, url = name.strip(), url.strip()
         if not name or not url:
             raise ValueError("商品名称和链接不能为空")
-        if not url.startswith(("https://item.taobao.com/", "https://detail.tmall.com/", "https://m.tb.cn/")):
-            raise ValueError("首版只接受淘宝、天猫或 m.tb.cn 商品链接")
+        url = normalize_product_url(url)
         stamp = now_iso()
         return self._execute(
             "INSERT INTO products(name,url,sku_note,quantity,created_at,updated_at) VALUES(?,?,?,?,?,?)",
@@ -149,16 +176,69 @@ class V2Store:
         )
 
     def list_tasks(self) -> list[dict[str, Any]]:
-        return self._query(
-            """SELECT t.*,a.nickname AS account_name,p.name AS product_name,p.url AS product_url
-               FROM tasks t JOIN accounts a ON a.id=t.account_id
-               JOIN products p ON p.id=t.product_id ORDER BY t.id DESC"""
+        return self._query(f"{self._task_select()} ORDER BY t.id DESC")
+
+    @staticmethod
+    def _task_select() -> str:
+        return """SELECT t.*,a.nickname AS account_name,p.name AS product_name,p.url AS product_url,
+                         p.sku_note AS product_sku_note,p.quantity AS product_quantity
+                  FROM tasks t JOIN accounts a ON a.id=t.account_id
+                  JOIN products p ON p.id=t.product_id"""
+
+    def get_task(self, task_id: int) -> dict[str, Any] | None:
+        rows = self._query(f"{self._task_select()} WHERE t.id=?", (task_id,))
+        return rows[0] if rows else None
+
+    def set_task_status(self, task_id: int, status: str, last_error: str | None = None) -> None:
+        if last_error is None:
+            self._execute(
+                "UPDATE tasks SET status=?,updated_at=? WHERE id=?",
+                (status, now_iso(), task_id),
+            )
+        else:
+            self._execute(
+                "UPDATE tasks SET status=?,last_error=?,updated_at=? WHERE id=?",
+                (status, last_error, now_iso(), task_id),
+            )
+
+    def clear_task_authorization(self, task_id: int, status: str = "待授权") -> None:
+        self._execute(
+            """UPDATE tasks SET authorized_at='',status=?,last_error='',attempt_count=0,
+               triggered_at='',completed_at='',updated_at=? WHERE id=?""",
+            (status, now_iso(), task_id),
         )
 
-    def set_task_status(self, task_id: int, status: str) -> None:
+    def authorize_task(self, task_id: int) -> None:
+        stamp = now_iso()
         self._execute(
-            "UPDATE tasks SET status=?,updated_at=? WHERE id=?",
-            (status, now_iso(), task_id),
+            "UPDATE tasks SET authorized_at=?,status='已武装',last_error='',updated_at=? WHERE id=?",
+            (stamp, stamp, task_id),
+        )
+
+    def set_task_schedule(self, task_id: int, scheduled_at: str) -> None:
+        self._execute(
+            "UPDATE tasks SET scheduled_at=?,updated_at=? WHERE id=?",
+            (scheduled_at, now_iso(), task_id),
+        )
+
+    def mark_task_triggered(self, task_id: int) -> None:
+        stamp = now_iso()
+        self._execute(
+            "UPDATE tasks SET status='触发中',triggered_at=?,updated_at=? WHERE id=?",
+            (stamp, stamp, task_id),
+        )
+
+    def increment_task_attempt(self, task_id: int) -> None:
+        self._execute(
+            "UPDATE tasks SET attempt_count=attempt_count+1,updated_at=? WHERE id=?",
+            (now_iso(), task_id),
+        )
+
+    def mark_task_completed(self, task_id: int, status: str) -> None:
+        stamp = now_iso()
+        self._execute(
+            "UPDATE tasks SET status=?,completed_at=?,last_error='',updated_at=? WHERE id=?",
+            (status, stamp, stamp, task_id),
         )
 
     def log(self, level: str, category: str, message: str, subject: str = "") -> None:
