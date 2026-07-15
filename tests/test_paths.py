@@ -44,7 +44,7 @@ class PortablePathTests(unittest.TestCase):
                 migrated_profile = Path(
                     connection.execute("SELECT profile_dir FROM accounts WHERE id=?", (account_id,)).fetchone()[0]
                 )
-            self.assertEqual(migrated_profile.parent, target / "profiles")
+            self.assertTrue(migrated_profile.parent.samefile(target / "profiles"))
             self.assertEqual((migrated_profile / "profile-marker.txt").read_text(encoding="utf-8"), "cookie-placeholder")
             self.assertFalse(migrate_legacy_data(legacy, target))
 
