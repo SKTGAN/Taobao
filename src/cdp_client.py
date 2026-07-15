@@ -52,6 +52,8 @@ class CdpClient:
                 origin="http://127.0.0.1",
                 open_timeout=self.timeout,
                 close_timeout=1,
+                compression=None,
+                proxy=None,
             ) as connection:
                 yield CdpSession(connection, self.timeout, self._ids)
         except CdpError:

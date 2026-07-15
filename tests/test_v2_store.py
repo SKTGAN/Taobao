@@ -61,6 +61,32 @@ class V2StoreTests(unittest.TestCase):
         self.store.set_task_schedule(task_id, "2026-07-13T20:00:00.125")
         self.assertEqual(self.store.get_task(task_id)["scheduled_at"], "2026-07-13T20:00:00.125")
 
+    def test_stores_task_specific_style_and_quantity(self) -> None:
+        account_id = self.store.add_account("账号A")
+        product_id = self.store.add_product("商品A", "https://item.taobao.com/item.htm?id=1")
+        task_id = self.store.add_task("任务A", account_id, product_id, "2026-07-13T20:00:00")
+        self.store.set_task_selection(
+            task_id,
+            "https://item.taobao.com/item.htm?id=1&skuId=606",
+            "红色 / 大号",
+            2,
+        )
+        task = self.store.get_task(task_id)
+        self.assertEqual(task["product_url"], "https://item.taobao.com/item.htm?id=1&skuId=606")
+        self.assertEqual(task["product_sku_note"], "红色 / 大号")
+        self.assertEqual(task["product_quantity"], 2)
+
+    def test_updates_product_url_with_sku(self) -> None:
+        product_id = self.store.add_product("商品A", "https://item.taobao.com/item.htm?id=1")
+        self.store.update_product_url(
+            product_id,
+            "https://item.taobao.com/item.htm?id=1&skuId=606&spm=tracking",
+        )
+        self.assertEqual(
+            self.store.get_product(product_id)["url"],
+            "https://item.taobao.com/item.htm?id=1&skuId=606",
+        )
+
     def test_restart_requires_fresh_authorization(self) -> None:
         account_id = self.store.add_account("账号A")
         product_id = self.store.add_product("商品A", "https://item.taobao.com/item.htm?id=1")
@@ -70,6 +96,15 @@ class V2StoreTests(unittest.TestCase):
         task = reopened.get_task(task_id)
         self.assertEqual(task["status"], "需重新准备")
         self.assertEqual(task["authorized_at"], "")
+
+    def test_restart_invalidates_unfinished_checkout_review(self) -> None:
+        account_id = self.store.add_account("账号A")
+        product_id = self.store.add_product("商品A", "https://item.taobao.com/item.htm?id=1")
+        task_id = self.store.add_task("任务A", account_id, product_id, "2026-07-13T20:00:00")
+        self.store.set_task_status(task_id, "待核对订单", "")
+        reopened = V2Store(self.store.db_path)
+        task = reopened.get_task(task_id)
+        self.assertEqual(task["status"], "需重新准备")
 
     def test_rejects_unrelated_product_url(self) -> None:
         with self.assertRaises(ValueError):

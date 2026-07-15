@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 
-from src.safe_browser import PersistentChromeSession, find_google_chrome
+from src.safe_browser import BrowserLaunchError, PersistentChromeSession, find_google_chrome
 from src.task_runner import SingleAccountTaskRunner
 from src.v2_store import V2Store
 
@@ -68,17 +68,26 @@ class BrowserCheckoutFlowTests(unittest.TestCase):
             )
             try:
                 deadline = time.monotonic() + 15
-                while time.monotonic() < deadline and not (profile_dir / "DevToolsActivePort").exists():
+                session = PersistentChromeSession(profile_dir)
+                while time.monotonic() < deadline:
                     if process.poll() is not None:
                         self.fail("headless Chrome exited before DevTools became available")
+                    # Chrome can create DevToolsActivePort shortly before its
+                    # HTTP discovery endpoint starts accepting connections.
+                    if (profile_dir / "DevToolsActivePort").exists() and session._adopt_running_session():
+                        break
                     time.sleep(0.1)
-
-                session = PersistentChromeSession(profile_dir)
-                self.assertTrue(session._adopt_running_session())
+                else:
+                    self.fail("headless Chrome DevTools endpoint did not become available")
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
-                    if session.inspect_page().kind == "product":
-                        break
+                    try:
+                        if session.inspect_page().kind == "product":
+                            break
+                    except BrowserLaunchError:
+                        # The first page WebSocket can be replaced once while
+                        # headless Chrome finishes creating its initial tab.
+                        pass
                     time.sleep(0.1)
                 else:
                     self.fail("mock product page did not become ready")
@@ -101,6 +110,10 @@ class BrowserCheckoutFlowTests(unittest.TestCase):
                 outcome = SingleAccountTaskRunner(store, FixedSessions(session)).run(task_id, product_target_id)
                 self.assertEqual(outcome.status, "待付款", outcome.message)
                 self.assertEqual(session.inspect_page().kind, "pending_payment")
+                self.assertFalse(
+                    any(str(page.get("url") or "").endswith("/privacy.html") for page in session._list_pages()),
+                    "submit click opened the privacy-help page instead of the payment page",
+                )
             finally:
                 server.shutdown()
                 server.server_close()

@@ -23,10 +23,25 @@ from src.product_urls import normalize_product_url
 LOGIN_URL = "https://login.taobao.com/"
 ACCOUNT_HOME_URL = "https://i.taobao.com/my_taobao.htm"
 CART_URL = "https://cart.taobao.com/cart.htm"
+BOUGHT_ITEMS_URL = "https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm"
+AUXILIARY_PAGE_TOKENS = (
+    "phone-privacy",
+    "privacy-rule",
+    "privacy_rule",
+    "agreement",
+    "rules.htm",
+)
 
 
 class BrowserLaunchError(RuntimeError):
     pass
+
+
+def _is_auxiliary_page(url: str) -> bool:
+    normalized = url.lower()
+    return any(token in normalized for token in AUXILIARY_PAGE_TOKENS) and any(
+        host in normalized for host in ("taobao.com", "tmall.com")
+    )
 
 
 def _new_target_url(debug_base: str, target_url: str) -> str:
@@ -36,7 +51,13 @@ def _new_target_url(debug_base: str, target_url: str) -> str:
     return f"{debug_base}/json/new?{encoded}"
 
 
-def find_google_chrome() -> Path:
+def find_google_chrome(configured_path: str | Path | None = None) -> Path:
+    if configured_path and str(configured_path).strip():
+        candidate = Path(str(configured_path).strip()).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+        raise BrowserLaunchError(f"配置的 Chrome 路径不存在：{candidate}")
+
     candidates = [
         Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
         Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
@@ -71,10 +92,10 @@ def _read_devtools_active_port(profile_dir: str | Path) -> int | None:
 class PersistentChromeSession:
     """直接启动可见 Google Chrome；不依赖 ChromeDriver，不修改浏览器指纹。"""
 
-    def __init__(self, profile_dir: str | Path, _driver_path: str = ""):
+    def __init__(self, profile_dir: str | Path, chrome_path: str = ""):
         self.profile_dir = Path(profile_dir).resolve()
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        self.chrome_path = find_google_chrome()
+        self.chrome_path = find_google_chrome(chrome_path)
         self.debug_port = _free_local_port()
         self.process: subprocess.Popen | None = None
         self.cdp = CdpClient(timeout=8.0)
@@ -176,6 +197,18 @@ class PersistentChromeSession:
         except Exception as exc:
             raise BrowserLaunchError("无法读取账号 Chrome 的页面列表。") from exc
 
+    def auxiliary_pages(self) -> list[dict[str, str]]:
+        """Return open Taobao privacy/agreement/help tabs without interacting with them."""
+        return [
+            {
+                "id": str(item.get("id") or ""),
+                "title": str(item.get("title") or ""),
+                "url": str(item.get("url") or ""),
+            }
+            for item in self._list_pages()
+            if _is_auxiliary_page(str(item.get("url") or ""))
+        ]
+
     def _page_target(self, target_id: str | None = None) -> dict:
         pages = self._list_pages()
         if target_id:
@@ -201,7 +234,9 @@ class PersistentChromeSession:
                 if str(item.get("id") or "") not in baseline_ids and item.get("id") != target_id
             ]
             candidate_map = {
-                str(item.get("id") or ""): item for item in [*descendants, *new_pages] if item.get("id")
+                str(item.get("id") or ""): item
+                for item in [*descendants, *new_pages]
+                if item.get("id") and not _is_auxiliary_page(str(item.get("url") or ""))
             }
             candidates = list(candidate_map.values())
 
@@ -231,6 +266,7 @@ class PersistentChromeSession:
                 host in str(item.get("url") or "").lower()
                 for host in ("taobao.com", "tmall.com", "alipay.com")
             )
+            and not _is_auxiliary_page(str(item.get("url") or ""))
         ]
         if candidates:
             def priority(item: dict) -> int:
@@ -290,6 +326,25 @@ class PersistentChromeSession:
         websocket_url = str(target.get("webSocketDebuggerUrl") or "")
         try:
             with self.cdp.session(websocket_url) as cdp_session:
+                # Newly opened checkout tabs can remain hidden behind the product
+                # tab or the local GUI. Taobao's settlement component expects the
+                # target tab to be visible before it accepts the pointer sequence.
+                cdp_session.call("Page.bringToFront")
+                visibility_deadline = time.monotonic() + 1.0
+                while True:
+                    visibility_result = cdp_session.call(
+                        "Runtime.evaluate",
+                        {
+                            "expression": "({visible: document.visibilityState === 'visible', focused: document.hasFocus()})",
+                            "returnByValue": True,
+                        },
+                    )
+                    visibility = self._runtime_value(visibility_result)
+                    if isinstance(visibility, dict) and visibility.get("visible"):
+                        break
+                    if time.monotonic() >= visibility_deadline:
+                        raise BrowserLaunchError("Chrome 目标页面无法切换到前台，请保持账号 Chrome 窗口打开。")
+                    time.sleep(0.05)
                 runtime_result = cdp_session.call(
                     "Runtime.evaluate",
                     {
@@ -301,17 +356,25 @@ class PersistentChromeSession:
                 )
                 result = self._runtime_value(runtime_result)
                 if not isinstance(result, dict) or not result.get("found"):
-                    return {"clicked": False, "text": ""}
+                    return {
+                        "clicked": False,
+                        "text": str(result.get("text") or "") if isinstance(result, dict) else "",
+                        "reason": str(result.get("reason") or "not_found")
+                        if isinstance(result, dict)
+                        else "not_found",
+                    }
                 x = float(result["x"])
                 y = float(result["y"])
                 cdp_session.call(
                     "Input.dispatchMouseEvent",
                     {"type": "mouseMoved", "x": x, "y": y, "button": "none"},
                 )
+                time.sleep(0.03)
                 cdp_session.call(
                     "Input.dispatchMouseEvent",
                     {"type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1},
                 )
+                time.sleep(0.03)
                 try:
                     cdp_session.call(
                         "Input.dispatchMouseEvent",
@@ -324,6 +387,23 @@ class PersistentChromeSession:
         except (CdpError, KeyError, TypeError, ValueError) as exc:
             raise BrowserLaunchError(f"无法向 Chrome 发送鼠标点击：{exc}") from exc
         return {"clicked": True, "text": str(result.get("text") or ""), "method": "cdp_mouse"}
+
+    def reload_page(self, target_id: str | None = None) -> None:
+        """Reload the selected checkout/payment tab without submitting another order."""
+        target = self._page_target(target_id)
+        websocket_url = str(target.get("webSocketDebuggerUrl") or "")
+        if not websocket_url:
+            raise BrowserLaunchError("当前支付页面没有可用的控制通道。")
+        try:
+            with self.cdp.session(websocket_url) as cdp_session:
+                cdp_session.call("Page.bringToFront")
+                cdp_session.call("Page.reload", {"ignoreCache": True})
+        except CdpError as exc:
+            raise BrowserLaunchError(f"支付页面重新加载失败：{exc}") from exc
+
+    def open_bought_items(self) -> None:
+        """Open Taobao orders as a safe fallback; never selects or pays an order."""
+        self._open_target(BOUGHT_ITEMS_URL)
 
     def open_login(self) -> None:
         self._open_target(LOGIN_URL)
@@ -378,6 +458,25 @@ class PersistentChromeSession:
             time.sleep(0.1)
         return None
 
+    def navigate_product(self, url: str, target_id: str | None = None) -> str | None:
+        """Navigate the prepared product tab to an exact product/SKU URL."""
+        normalized_url = normalize_product_url(url)
+        if not target_id:
+            return self.open_product(normalized_url)
+        target = next(
+            (item for item in self._list_pages() if str(item.get("id") or "") == target_id),
+            None,
+        )
+        if not target or not target.get("webSocketDebuggerUrl"):
+            return self.open_product(normalized_url)
+        try:
+            with self.cdp.session(str(target["webSocketDebuggerUrl"])) as cdp_session:
+                cdp_session.call("Page.bringToFront")
+                cdp_session.call("Page.navigate", {"url": normalized_url})
+        except CdpError as exc:
+            raise BrowserLaunchError(f"无法打开本次选择的商品款式：{exc}") from exc
+        return target_id
+
     def open_cart(self) -> None:
         self._open_target(CART_URL)
 
@@ -387,14 +486,15 @@ class PersistentChromeSession:
 
 
 class BrowserSessionManager:
-    def __init__(self):
+    def __init__(self, chrome_path: str = ""):
+        self.chrome_path = chrome_path
         self._sessions: dict[int, PersistentChromeSession] = {}
 
     def get_or_create(self, account: dict, driver_path: str = "") -> PersistentChromeSession:
         account_id = int(account["id"])
         session = self._sessions.get(account_id)
         if session is None:
-            session = PersistentChromeSession(account["profile_dir"], driver_path)
+            session = PersistentChromeSession(account["profile_dir"], driver_path or self.chrome_path)
             self._sessions[account_id] = session
         return session
 

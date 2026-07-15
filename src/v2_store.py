@@ -48,6 +48,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempt_count INTEGER NOT NULL DEFAULT 0,
     triggered_at TEXT NOT NULL DEFAULT '',
     completed_at TEXT NOT NULL DEFAULT '',
+    selected_url TEXT NOT NULL DEFAULT '',
+    selected_sku_note TEXT NOT NULL DEFAULT '',
+    selected_quantity INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -84,7 +87,10 @@ class V2Store:
                 connection.execute(
                     """UPDATE tasks SET status='需重新准备',authorized_at='',
                        last_error='程序重启后需重新预检并授权',updated_at=?
-                       WHERE status IN ('已武装','等待中','触发中','提交中')""",
+                       WHERE status IN (
+                           '款式预检中','待核对订单','授权检查中',
+                           '已武装','等待中','触发中','提交中'
+                       )""",
                     (now_iso(),),
                 )
 
@@ -97,6 +103,9 @@ class V2Store:
             "attempt_count": "INTEGER NOT NULL DEFAULT 0",
             "triggered_at": "TEXT NOT NULL DEFAULT ''",
             "completed_at": "TEXT NOT NULL DEFAULT ''",
+            "selected_url": "TEXT NOT NULL DEFAULT ''",
+            "selected_sku_note": "TEXT NOT NULL DEFAULT ''",
+            "selected_quantity": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -180,8 +189,10 @@ class V2Store:
 
     @staticmethod
     def _task_select() -> str:
-        return """SELECT t.*,a.nickname AS account_name,p.name AS product_name,p.url AS product_url,
-                         p.sku_note AS product_sku_note,p.quantity AS product_quantity
+        return """SELECT t.*,a.nickname AS account_name,p.name AS product_name,
+                         CASE WHEN t.selected_url<>'' THEN t.selected_url ELSE p.url END AS product_url,
+                         CASE WHEN t.selected_sku_note<>'' THEN t.selected_sku_note ELSE p.sku_note END AS product_sku_note,
+                         CASE WHEN t.selected_quantity>0 THEN t.selected_quantity ELSE p.quantity END AS product_quantity
                   FROM tasks t JOIN accounts a ON a.id=t.account_id
                   JOIN products p ON p.id=t.product_id"""
 
@@ -219,6 +230,29 @@ class V2Store:
         self._execute(
             "UPDATE tasks SET scheduled_at=?,updated_at=? WHERE id=?",
             (scheduled_at, now_iso(), task_id),
+        )
+
+    def set_task_selection(
+        self,
+        task_id: int,
+        selected_url: str,
+        selected_sku_note: str,
+        selected_quantity: int,
+    ) -> None:
+        quantity = int(selected_quantity)
+        if not 1 <= quantity <= 5:
+            raise ValueError("商品数量必须在 1-5 之间")
+        selected_url = normalize_product_url(selected_url)
+        self._execute(
+            """UPDATE tasks SET selected_url=?,selected_sku_note=?,selected_quantity=?,
+               authorized_at='',updated_at=? WHERE id=?""",
+            (selected_url, selected_sku_note.strip(), quantity, now_iso(), task_id),
+        )
+
+    def update_product_url(self, product_id: int, url: str) -> None:
+        self._execute(
+            "UPDATE products SET url=?,updated_at=? WHERE id=?",
+            (normalize_product_url(url), now_iso(), product_id),
         )
 
     def mark_task_triggered(self, task_id: int) -> None:
