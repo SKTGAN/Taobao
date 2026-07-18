@@ -2,30 +2,44 @@ from __future__ import annotations
 
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import flet as ft
 
-from src.paths import PROJECT_ROOT
+from src.app_config import AppConfig, load_config, save_config, validate_port
+from src.environment_check import EnvironmentCheck, run_environment_checks
 from src.page_automation import has_enabled_action, product_precheck_finished
-from src.safe_browser import BrowserLaunchError, BrowserSessionManager
-from src.task_runner import SingleAccountTaskRunner, parse_scheduled_at
+from src.paths import prepare_data_dir
+from src.product_urls import resolve_product_selection, sku_id_from_url
+from src.safe_browser import BrowserLaunchError, BrowserSessionManager, find_google_chrome
+from src.task_runner import BUY_ACTIONS, SUBMIT_ACTIONS, SingleAccountTaskRunner, parse_scheduled_at
 from src.v2_store import V2Store
 
 
 class FletGUI:
     APP_NAME = "TaoBao Assistant V2"
 
-    def __init__(self, _legacy_config_path: Path | None = None):
-        self.store = V2Store(PROJECT_ROOT / "data" / "taobao_assistant_v2.db")
-        self.sessions = BrowserSessionManager()
+    def __init__(
+        self,
+        _legacy_config_path: Path | None = None,
+        *,
+        data_dir: Path | None = None,
+        config: AppConfig | None = None,
+    ):
+        self.data_dir = Path(data_dir) if data_dir is not None else prepare_data_dir()
+        self.config = config or load_config(self.data_dir)
+        self.store = V2Store(self.data_dir / "taobao_assistant_v2.db")
+        self.sessions = BrowserSessionManager(self.config.chrome_path)
         self.page: ft.Page | None = None
         self.content: ft.Container | None = None
         self.rail: ft.NavigationRail | None = None
         self._selected_index = 0
         self._task_targets: dict[int, str | None] = {}
         self._task_cancel_events: dict[int, threading.Event] = {}
+        self._environment_results: list[EnvironmentCheck] = []
+        self._environment_check_running = False
         self.runner = SingleAccountTaskRunner(self.store, self.sessions)
 
     def build(self, page: ft.Page) -> None:
@@ -67,6 +81,8 @@ class FletGUI:
         self.content = ft.Container(expand=True, padding=28)
         page.add(ft.Row([self.rail, ft.VerticalDivider(width=1), self.content], expand=True, spacing=0))
         self._render()
+        if not self.config.first_run_complete:
+            self._run_environment_check(first_run=True)
 
     def _navigate(self, event) -> None:
         self._selected_index = int(event.control.selected_index)
@@ -118,7 +134,11 @@ class FletGUI:
         products = self.store.list_products()
         tasks = self.store.list_tasks()
         logged_in = sum(1 for account in accounts if account["status"] == "已登录")
-        ready = sum(1 for task in tasks if task["status"] in {"待授权", "已武装", "等待中"})
+        ready = sum(
+            1
+            for task in tasks
+            if task["status"] in {"待授权", "待核对订单", "已武装", "等待中"}
+        )
         return ft.Column([
             self._header("运行概览", "扫码登录、商品准备和任务状态一目了然"),
             ft.Row([
@@ -129,7 +149,11 @@ class FletGUI:
             ], spacing=14),
             self._card(ft.Column([
                 ft.Text("安全工作流", size=18, weight=ft.FontWeight.BOLD),
-                ft.Text("1. 扫码登录 → 2. 添加商品和任务 → 3. 准备商品 → 4. 人工核对 SKU/数量/地址/价格 → 5. 单次授权。", color="#475569"),
+                ft.Text(
+                    "1. 扫码登录 → 2. 准备并固定 SKU → 3. 提前进入确认订单 → "
+                    "4. 人工核对地址/价格/号码保护/协议 → 5. 单次定时授权。",
+                    color="#475569",
+                ),
                 ft.Container(
                     content=ft.Row([
                         ft.Icon(ft.Icons.SECURITY, color="#166534"),
@@ -196,9 +220,10 @@ class FletGUI:
         rows = []
         for task in tasks:
             task_id = int(task["id"])
+            authorization_label = "核对后授权" if task["status"] == "待核对订单" else "授权"
             actions = [
                 ft.FilledTonalButton("准备商品", icon=ft.Icons.PLAY_ARROW, on_click=lambda e, tid=task_id: self._prepare_task(tid)),
-                ft.TextButton("授权", icon=ft.Icons.VERIFIED_USER_OUTLINED, on_click=lambda e, tid=task_id: self._show_authorize_task(tid)),
+                ft.TextButton(authorization_label, icon=ft.Icons.VERIFIED_USER_OUTLINED, on_click=lambda e, tid=task_id: self._show_authorize_task(tid)),
                 ft.TextButton("打开购物车", icon=ft.Icons.SHOPPING_CART_OUTLINED, on_click=lambda e, tid=task_id: self._open_task_cart(tid)),
             ]
             if task["status"] in {"已武装", "等待中", "触发中", "提交中"}:
@@ -246,17 +271,109 @@ class FletGUI:
         ], spacing=22, scroll=ft.ScrollMode.AUTO, expand=True)
 
     def _settings(self) -> ft.Control:
+        chrome_path = ft.TextField(
+            label="Google Chrome 路径（留空则自动查找）",
+            value=self.config.chrome_path,
+            hint_text=r"例如：C:\Program Files\Google\Chrome\Application\chrome.exe",
+            expand=True,
+        )
+        port = ft.TextField(
+            label="本地服务端口",
+            value=str(self.config.port),
+            keyboard_type=ft.KeyboardType.NUMBER,
+            width=220,
+        )
+        result_controls: list[ft.Control] = []
+        for item in self._environment_results:
+            passed = item.passed
+            result_controls.append(
+                ft.ListTile(
+                    leading=ft.Icon(
+                        ft.Icons.CHECK_CIRCLE_OUTLINE if passed else ft.Icons.ERROR_OUTLINE,
+                        color="#15803D" if passed else "#B91C1C",
+                    ),
+                    title=ft.Text(f"{item.name} · {item.status}"),
+                    subtitle=ft.Text(item.message, selectable=True),
+                )
+            )
+        if not result_controls:
+            result_controls.append(ft.Text("尚未执行环境自检。", color="#64748B"))
         return ft.Column([
-            self._header("设置", "当前版本使用保守、稳定的浏览器策略"),
+            self._header("设置", "Chrome、端口和首次运行环境检查"),
             self._card(ft.Column([
-                ft.ListTile(leading=ft.Icon(ft.Icons.CHROME_READER_MODE), title=ft.Text("Google Chrome"), subtitle=ft.Text("直接启动本机 Chrome；V2 不需要 ChromeDriver 或 Selenium Manager")),
+                ft.Text("运行配置", size=18, weight=ft.FontWeight.BOLD),
+                ft.Row([chrome_path, port]),
+                ft.Row([
+                    ft.FilledButton(
+                        "保存配置",
+                        icon=ft.Icons.SAVE_OUTLINED,
+                        on_click=lambda e: self._save_settings(chrome_path, port),
+                    ),
+                    ft.OutlinedButton(
+                        "运行环境自检",
+                        icon=ft.Icons.FACT_CHECK_OUTLINED,
+                        disabled=self._environment_check_running,
+                        on_click=lambda e: self._run_environment_check(),
+                    ),
+                ]),
+                ft.Text("端口修改后需重新启动程序；Chrome 路径会用于新建或重新连接账号浏览器。", size=12, color="#64748B"),
                 ft.ListTile(leading=ft.Icon(ft.Icons.LAN), title=ft.Text("代理"), subtitle=ft.Text("默认不使用代理；正常能访问淘宝时请保持为空")),
                 ft.ListTile(leading=ft.Icon(ft.Icons.FINGERPRINT), title=ft.Text("浏览器指纹"), subtitle=ft.Text("使用真实浏览器默认值，不随机 UA，不伪造 Canvas/WebGL")),
                 ft.ListTile(leading=ft.Icon(ft.Icons.PAYMENT), title=ft.Text("支付与提交"), subtitle=ft.Text("授权后只自动提交到待付款；支付始终由用户在淘宝官方页面完成")),
                 ft.Divider(),
-                ft.Text(f"本地数据：{self.store.db_path}", size=12, color="#64748B"),
+                ft.Text("环境自检结果", size=18, weight=ft.FontWeight.BOLD),
+                *result_controls,
+                ft.Divider(),
+                ft.Text(f"通用数据目录：{self.data_dir}", size=12, color="#64748B", selectable=True),
             ], spacing=4)),
         ], spacing=22, scroll=ft.ScrollMode.AUTO, expand=True)
+
+    def _save_settings(self, chrome_path, port) -> None:
+        try:
+            normalized_chrome = str(chrome_path.value or "").strip()
+            if normalized_chrome:
+                normalized_chrome = str(find_google_chrome(normalized_chrome))
+            updated = AppConfig(
+                port=validate_port(port.value),
+                chrome_path=normalized_chrome,
+                first_run_complete=self.config.first_run_complete,
+            )
+            save_config(updated, self.data_dir)
+            self.config = updated
+            self.sessions.close_all()
+            self.sessions.chrome_path = updated.chrome_path
+            self._notify("配置已保存。端口变更将在下次启动时生效。")
+            self._render()
+        except (ValueError, BrowserLaunchError) as exc:
+            self._notify(str(exc), error=True)
+
+    def _run_environment_check(self, _event=None, *, first_run: bool = False) -> None:
+        if self._environment_check_running:
+            return
+        self._environment_check_running = True
+        if self.page is not None:
+            self._notify("正在检查 Python、Chrome、数据目录、端口和网络……")
+
+        def operation() -> None:
+            try:
+                self._environment_results = run_environment_checks(self.config, self.data_dir)
+                if first_run and not self.config.first_run_complete:
+                    self.config = replace(self.config, first_run_complete=True)
+                    save_config(self.config, self.data_dir)
+                failures = [item for item in self._environment_results if not item.passed]
+                message = (
+                    "首次运行环境自检已通过。"
+                    if not failures
+                    else "环境自检完成，但有项目未通过。请进入“设置”查看处理建议。"
+                )
+                self._notify(message, error=bool(failures))
+            except Exception as exc:
+                self._notify(f"环境自检失败：{exc}", error=True)
+            finally:
+                self._environment_check_running = False
+                self._render()
+
+        threading.Thread(target=operation, daemon=True, name="environment-check").start()
 
     @staticmethod
     def _status_badge(status: str) -> ft.Container:
@@ -265,6 +382,9 @@ class FletGUI:
             "等待扫码": ("#FEF3C7", "#92400E"),
             "预检中": ("#DBEAFE", "#1D4ED8"),
             "待授权": ("#FEF3C7", "#92400E"),
+            "款式预检中": ("#DBEAFE", "#1D4ED8"),
+            "待核对订单": ("#FFEDD5", "#9A3412"),
+            "授权检查中": ("#DBEAFE", "#1D4ED8"),
             "已武装": ("#DCFCE7", "#166534"),
             "等待中": ("#DBEAFE", "#1D4ED8"),
             "触发中": ("#EDE9FE", "#6D28D9"),
@@ -458,7 +578,7 @@ class FletGUI:
                 else:
                     self.store.set_task_status(task_id, "待授权", "")
                     self.store.log("INFO", "任务", "商品页预检通过，等待用户核对并授权", task["name"])
-                    self._notify("预检通过。请在商品页选好 SKU 和数量，核对无误后回到任务中心点击“授权”。")
+                    self._notify("预检通过。请回到任务中心点击“授权”，为本次任务固定 SKU、数量和款式说明。")
             except BrowserLaunchError as exc:
                 self.store.set_task_status(task_id, "失败", str(exc))
                 self.store.log("ERROR", "任务", str(exc), task["name"])
@@ -471,10 +591,33 @@ class FletGUI:
         task = next((item for item in self.store.list_tasks() if int(item["id"]) == task_id), None)
         if not task:
             return
+        if task["status"] == "待核对订单":
+            return self._show_checkout_authorization(task)
         if task["status"] != "待授权":
             return self._notify("请先点击“准备商品”并完成页面预检。", error=True)
+        current_sku_id = sku_id_from_url(str(task["product_url"]))
+        has_variants = ft.Checkbox(
+            label="此商品有颜色、口味、尺码等可选款式，本次必须固定 SKU",
+            value=bool(current_sku_id or task["product_sku_note"]),
+        )
+        sku_input = ft.TextField(
+            label="本次款式链接或 SKU ID",
+            value=current_sku_id,
+            hint_text="例如：6064684260474，或粘贴已选好款式的同一商品链接",
+            helper_text="程序只保留商品 ID 与 SKU ID，不保存跟踪参数。",
+        )
+        sku_note = ft.TextField(
+            label="本次款式说明",
+            value=str(task["product_sku_note"] or ""),
+            hint_text="例如：气血充足月经正常面若桃花 / 2盒",
+        )
+        quantity = ft.Dropdown(
+            label="本次数量",
+            value=str(task["product_quantity"]),
+            options=[ft.dropdown.Option(str(value), str(value)) for value in range(1, 6)],
+        )
         confirmed = ft.Checkbox(
-            label="我已在淘宝页面核对商品、SKU、数量、价格和收货信息，并同意本任务到点自动提交订单。",
+            label="我已核对本次商品、SKU 和数量，允许程序现在进入确认订单页；本步骤不会提交订单。",
             value=False,
         )
         scheduled = ft.TextField(
@@ -483,20 +626,48 @@ class FletGUI:
         )
         details = ft.Column([
             ft.Text(f"商品：{task['product_name']}", weight=ft.FontWeight.BOLD),
-            ft.Text(f"SKU 备注：{task['product_sku_note'] or '未填写'}"),
-            ft.Text(f"数量：{task['product_quantity']}"),
+            has_variants,
+            sku_input,
+            sku_note,
+            quantity,
             scheduled,
-            ft.Text("程序只提交到待付款，不会自动支付。遇到验证码或风控会暂停。", color="#9A3412"),
+            ft.Text(
+                "本步骤会应用 SKU 并立即进入确认订单页，但不会提交订单。进入后请人工核对"
+                "收货地址、价格、数量、号码保护和协议选项，再回来完成最终授权。",
+                color="#9A3412",
+            ),
             confirmed,
-        ], tight=True, width=560)
-        dialog = ft.AlertDialog(title=ft.Text("授权单次定时下单"), content=details)
+        ], tight=True, width=620, height=570, scroll=ft.ScrollMode.AUTO)
+        dialog = ft.AlertDialog(title=ft.Text("第一步：准备确认订单"), content=details)
         dialog.actions = [
             ft.TextButton("取消", on_click=lambda e: self._close_dialog(dialog)),
-            ft.FilledButton("确认授权", on_click=lambda e: self._confirm_authorize_task(dialog, task_id, confirmed, scheduled)),
+            ft.FilledButton(
+                "应用款式并进入确认订单",
+                on_click=lambda e: self._confirm_authorize_task(
+                    dialog,
+                    task_id,
+                    confirmed,
+                    scheduled,
+                    has_variants,
+                    sku_input,
+                    sku_note,
+                    quantity,
+                ),
+            ),
         ]
         self._open_dialog(dialog)
 
-    def _confirm_authorize_task(self, dialog, task_id: int, confirmed, scheduled) -> None:
+    def _confirm_authorize_task(
+        self,
+        dialog,
+        task_id: int,
+        confirmed,
+        scheduled,
+        has_variants,
+        sku_input,
+        sku_note,
+        quantity,
+    ) -> None:
         if not confirmed.value:
             return self._notify("请先勾选授权确认。", error=True)
         if self._task_cancel_events:
@@ -506,17 +677,230 @@ class FletGUI:
             return self._notify("任务状态已经变化，请重新准备。", error=True)
         try:
             scheduled_at = parse_scheduled_at(scheduled.value)
+            selected_url = resolve_product_selection(task["product_url"], sku_input.value)
+            selected_quantity = int(quantity.value)
+        except ValueError as exc:
+            return self._notify(str(exc), error=True)
+        selected_sku_id = sku_id_from_url(selected_url)
+        if has_variants.value and not selected_sku_id:
+            return self._notify("该商品已标记为多款式，请填写本次 SKU ID 或粘贴已选款式的商品链接。", error=True)
+        account = self.store.get_account(int(task["account_id"]))
+        if not account:
+            return self._notify("任务账号不存在，请重新创建任务。", error=True)
+        self.store.set_task_selection(
+            task_id,
+            selected_url,
+            sku_note.value,
+            selected_quantity,
+        )
+        self.store.set_task_schedule(task_id, scheduled_at.isoformat(timespec="milliseconds"))
+        self.store.set_task_status(task_id, "款式预检中", "")
+        self._close_dialog(dialog)
+        self._notify("正在应用本次款式，并进入确认订单页供你人工核对……")
+        self._render()
+
+        def operation() -> None:
+            try:
+                session = self.sessions.get_or_create(account)
+                target_id = session.navigate_product(selected_url, self._task_targets.get(task_id))
+                self._task_targets[task_id] = target_id
+                deadline = time.monotonic() + 15
+                snapshot = None
+                while time.monotonic() < deadline:
+                    try:
+                        snapshot = session.inspect_page(target_id)
+                        if product_precheck_finished(snapshot, ("立即购买", "马上抢", "立即抢购", "支付定金")):
+                            break
+                    except BrowserLaunchError:
+                        pass
+                    time.sleep(0.3)
+                if snapshot is None:
+                    raise BrowserLaunchError("应用本次款式后未能读取商品页面。")
+                if snapshot.kind in {"login", "challenge"}:
+                    raise BrowserLaunchError("应用本次款式时出现登录或安全验证，请人工处理后重新准备。")
+                if snapshot.kind != "product" or not has_enabled_action(
+                    snapshot,
+                    BUY_ACTIONS,
+                ):
+                    raise BrowserLaunchError("本次 SKU 当前不可购买，请检查款式、库存和活动时间。")
+                auxiliary_pages = session.auxiliary_pages()
+                if auxiliary_pages:
+                    raise BrowserLaunchError(
+                        "检测到仍打开的隐私或协议说明页。请先关闭这些标签，再重新执行本步骤。"
+                    )
+                click_result = session.click_action(BUY_ACTIONS, target_id)
+                if not click_result.get("clicked"):
+                    reason = str(click_result.get("reason") or "not_found")
+                    raise BrowserLaunchError(f"未能安全点击“立即购买”进入确认订单页（{reason}）。")
+
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    auxiliary_pages = session.auxiliary_pages()
+                    if auxiliary_pages:
+                        raise BrowserLaunchError(
+                            "进入确认订单时打开了隐私或协议说明页。请关闭该标签，返回商品页后重新准备。"
+                        )
+                    snapshot = session.inspect_page(target_id)
+                    if snapshot.kind in {"confirm_order", "pending_payment", "payment_error", "login", "challenge"}:
+                        break
+                    time.sleep(0.2)
+                if snapshot.kind in {"login", "challenge"}:
+                    raise BrowserLaunchError("进入确认订单时出现登录或安全验证，请人工处理后重新准备。")
+                if snapshot.kind != "confirm_order":
+                    raise BrowserLaunchError("点击购买后未进入确认订单页，请检查商品状态并重新准备。")
+
+                self.store.set_task_status(task_id, "待核对订单", "")
+                sku_summary = f"SKU {selected_sku_id}" if selected_sku_id else "无独立 SKU"
+                note_summary = sku_note.value.strip() or "未填写款式说明"
+                self.store.log(
+                    "INFO",
+                    "任务",
+                    f"已进入确认订单页，等待人工核对：{sku_summary}；{note_summary}；数量 {selected_quantity}",
+                    task["name"],
+                )
+                self._notify(
+                    "已进入确认订单页。请在 Chrome 中核对地址、价格、数量、号码保护和协议选项；"
+                    "关闭所有隐私/规则说明标签后，回到任务中心点击“核对后授权”。"
+                )
+                self._render()
+            except (BrowserLaunchError, ValueError) as exc:
+                self.store.set_task_status(task_id, "需人工处理", str(exc))
+                self.store.log("WARNING", "任务", str(exc), task["name"])
+                self._notify(str(exc), error=True)
+                self._render()
+            except Exception as exc:
+                message = f"应用本次款式失败：{exc}"
+                self.store.set_task_status(task_id, "失败", message)
+                self.store.log("ERROR", "任务", message, task["name"])
+                self._notify(message, error=True)
+                self._render()
+
+        threading.Thread(target=operation, daemon=True, name=f"sku-precheck-{task_id}").start()
+
+    def _show_checkout_authorization(self, task: dict) -> None:
+        task_id = int(task["id"])
+        scheduled = ft.TextField(
+            label="本次计划时间（可修改，支持毫秒）",
+            value=task["scheduled_at"].replace("T", " "),
+        )
+        confirmed = ft.Checkbox(
+            label=(
+                "我已在确认订单页人工核对收货地址、商品款式、数量、价格、号码保护和协议选项，"
+                "并确认页面中的“提交订单”按钮可用。"
+            ),
+            value=False,
+        )
+        details = ft.Column(
+            [
+                ft.Text(f"商品：{task['product_name']}", weight=ft.FontWeight.BOLD),
+                ft.Text(f"款式：{task['product_sku_note'] or '未填写'}；数量：{task['product_quantity']}"),
+                scheduled,
+                ft.Container(
+                    content=ft.Text(
+                        "请先关闭 Chrome 中所有“隐私号保护规则说明”“协议”“规则”等辅助标签，"
+                        "并停留在确认订单页。程序不会代替你同意协议，也不会自动支付。",
+                        color="#9A3412",
+                    ),
+                    bgcolor="#FFF7ED",
+                    padding=12,
+                    border_radius=8,
+                ),
+                confirmed,
+            ],
+            tight=True,
+            width=620,
+            height=390,
+            scroll=ft.ScrollMode.AUTO,
+        )
+        dialog = ft.AlertDialog(title=ft.Text("第二步：核对确认订单并授权"), content=details)
+        dialog.actions = [
+            ft.TextButton("取消", on_click=lambda e: self._close_dialog(dialog)),
+            ft.FilledButton(
+                "确认并开始等待",
+                on_click=lambda e: self._confirm_checkout_authorization(
+                    dialog,
+                    task_id,
+                    confirmed,
+                    scheduled,
+                ),
+            ),
+        ]
+        self._open_dialog(dialog)
+
+    def _confirm_checkout_authorization(
+        self,
+        dialog,
+        task_id: int,
+        confirmed,
+        scheduled,
+    ) -> None:
+        if not confirmed.value:
+            return self._notify("请先完成确认订单页的人工核对并勾选确认。", error=True)
+        if self._task_cancel_events:
+            return self._notify("单账号阶段一次只能运行一个任务，请先停止当前任务。", error=True)
+        task = self.store.get_task(task_id)
+        if not task or task["status"] != "待核对订单":
+            return self._notify("任务状态已经变化，请重新准备。", error=True)
+        try:
+            scheduled_at = parse_scheduled_at(scheduled.value)
         except ValueError as exc:
             return self._notify(str(exc), error=True)
         if scheduled_at <= datetime.now() + timedelta(seconds=2):
             return self._notify("计划时间至少要晚于当前时间 2 秒，请修改后再授权。", error=True)
+        account = self.store.get_account(int(task["account_id"]))
+        if not account:
+            return self._notify("任务账号不存在，请重新创建任务。", error=True)
+
         self.store.set_task_schedule(task_id, scheduled_at.isoformat(timespec="milliseconds"))
-        self.store.authorize_task(task_id)
-        self.store.log("INFO", "任务", "用户已授权单次定时提交到待付款", task["name"])
+        self.store.set_task_status(task_id, "授权检查中", "")
         self._close_dialog(dialog)
-        self._notify("任务已武装并开始等待计划时间。")
+        self._notify("正在检查确认订单页和隐私/协议标签……")
         self._render()
-        self._start_task_runner(task_id)
+
+        def operation() -> None:
+            try:
+                session = self.sessions.get_or_create(account)
+                auxiliary_pages = session.auxiliary_pages()
+                if auxiliary_pages:
+                    raise BrowserLaunchError(
+                        "检测到隐私、协议或规则说明标签仍然打开。请关闭这些标签，返回确认订单页处理相关选项，"
+                        "然后再次点击“核对后授权”。"
+                    )
+                snapshot = session.inspect_page(self._task_targets.get(task_id))
+                if snapshot.kind in {"login", "challenge"}:
+                    raise BrowserLaunchError("最终授权时出现登录或安全验证，请人工处理后重新核对。")
+                if snapshot.kind != "confirm_order":
+                    raise BrowserLaunchError("当前不是确认订单页；确认页可能已失效，请重新点击“准备商品”。")
+                if not has_enabled_action(snapshot, SUBMIT_ACTIONS):
+                    raise BrowserLaunchError(
+                        "确认订单页的“提交订单”按钮不可用。请检查地址、价格、号码保护或协议选项后重试。"
+                    )
+                if scheduled_at <= datetime.now() + timedelta(seconds=2):
+                    raise BrowserLaunchError("页面检查完成时计划时间已过，请修改时间后再次授权。")
+
+                self.store.authorize_task(task_id)
+                self.store.log(
+                    "INFO",
+                    "任务",
+                    "确认订单页人工核对完成，已授权到点仅点击提交订单",
+                    task["name"],
+                )
+                self._notify("确认订单页检查通过，任务已武装；到点只会提交订单，不会自动支付。")
+                self._render()
+                self._start_task_runner(task_id)
+            except (BrowserLaunchError, ValueError) as exc:
+                self.store.set_task_status(task_id, "待核对订单", str(exc))
+                self.store.log("WARNING", "任务", str(exc), task["name"])
+                self._notify(str(exc), error=True)
+                self._render()
+            except Exception as exc:
+                message = f"最终授权检查失败：{exc}"
+                self.store.set_task_status(task_id, "待核对订单", message)
+                self.store.log("ERROR", "任务", message, task["name"])
+                self._notify(message, error=True)
+                self._render()
+
+        threading.Thread(target=operation, daemon=True, name=f"checkout-authorization-{task_id}").start()
 
     def _start_task_runner(self, task_id: int) -> None:
         cancel_event = threading.Event()

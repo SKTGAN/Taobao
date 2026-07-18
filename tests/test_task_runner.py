@@ -7,7 +7,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from src.page_automation import classify_page
-from src.task_runner import SingleAccountTaskRunner, parse_scheduled_at, safe_page_location
+from src.task_runner import (
+    SUBMIT_READY_TIMEOUT_SECONDS,
+    SingleAccountTaskRunner,
+    parse_scheduled_at,
+    safe_page_location,
+)
 from src.v2_store import V2Store
 
 
@@ -34,6 +39,13 @@ def snapshot(kind: str):
             "bodyText": "订单待付款",
             "controls": [],
         },
+        "payment_error": {
+            "url": "chrome-error://chromewebdata/",
+            "title": "tbapi.alipay.com",
+            "readyState": "complete",
+            "bodyText": "无法访问此网站 tbapi.alipay.com 意外终止了连接 ERR_CONNECTION_CLOSED",
+            "controls": [],
+        },
     }
     return classify_page(fixtures[kind])
 
@@ -53,6 +65,23 @@ class FakeSession:
             self.state = "pending_payment"
             return {"clicked": True, "text": "提交订单"}
         return {"clicked": False, "text": ""}
+
+
+class PreparedConfirmSession(FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.state = "confirm_order"
+
+
+class AuxiliaryPageSession(PreparedConfirmSession):
+    def auxiliary_pages(self):
+        return [
+            {
+                "id": "privacy",
+                "title": "隐私号保护规则说明",
+                "url": "https://huodong.taobao.com/wow/z/mt/default/phone-privacy-1-0",
+            }
+        ]
 
 
 class DelayedSubmitSession(FakeSession):
@@ -100,6 +129,24 @@ class DelayedSubmitButtonSession(FakeSession):
         return result
 
 
+class PaymentErrorSession(FakeSession):
+    def click_action(self, labels, _target_id=None):
+        if "提交订单" in labels and self.state == "confirm_order":
+            self.state = "payment_error"
+            return {"clicked": True, "text": "提交订单"}
+        return super().click_action(labels, _target_id)
+
+
+class RecoveringPaymentSession(PaymentErrorSession):
+    def __init__(self):
+        super().__init__()
+        self.reload_count = 0
+
+    def reload_page(self, _target_id=None):
+        self.reload_count += 1
+        self.state = "pending_payment"
+
+
 class FakeSessions:
     def __init__(self, session):
         self.session = session
@@ -126,6 +173,9 @@ class TaskRunnerTests(unittest.TestCase):
         parsed = parse_scheduled_at("2026-07-13 20:00:00.125")
         self.assertEqual(parsed.microsecond, 125000)
 
+    def test_submit_ready_timeout_allows_slow_confirm_page(self) -> None:
+        self.assertGreaterEqual(SUBMIT_READY_TIMEOUT_SECONDS, 30.0)
+
     def test_safe_page_location_removes_sensitive_query(self) -> None:
         page = classify_page(
             {
@@ -147,6 +197,20 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertTrue(task["triggered_at"])
         self.assertTrue(task["completed_at"])
 
+    def test_submits_prepared_confirm_page_without_clicking_buy_again(self) -> None:
+        self.store.authorize_task(self.task_id)
+        runner = SingleAccountTaskRunner(self.store, FakeSessions(PreparedConfirmSession()))
+        outcome = runner.run(self.task_id, "target-1")
+        self.assertEqual(outcome.status, "待付款")
+        self.assertEqual(self.store.get_task(self.task_id)["attempt_count"], 0)
+
+    def test_refuses_to_submit_while_privacy_rule_tab_is_open(self) -> None:
+        self.store.authorize_task(self.task_id)
+        runner = SingleAccountTaskRunner(self.store, FakeSessions(AuxiliaryPageSession()))
+        outcome = runner.run(self.task_id, "target-1")
+        self.assertEqual(outcome.status, "需人工处理")
+        self.assertIn("隐私、协议或规则说明标签", outcome.message)
+
     def test_refuses_task_without_authorization(self) -> None:
         runner = SingleAccountTaskRunner(self.store, FakeSessions(FakeSession()))
         outcome = runner.run(self.task_id, "target-1")
@@ -163,6 +227,24 @@ class TaskRunnerTests(unittest.TestCase):
         runner = SingleAccountTaskRunner(self.store, FakeSessions(DelayedSubmitButtonSession()))
         outcome = runner.run(self.task_id, "target-1")
         self.assertEqual(outcome.status, "待付款")
+
+    def test_reports_alipay_network_error_without_encouraging_duplicate_order(self) -> None:
+        self.store.authorize_task(self.task_id)
+        runner = SingleAccountTaskRunner(self.store, FakeSessions(PaymentErrorSession()))
+        outcome = runner.run(self.task_id, "target-1")
+        self.assertEqual(outcome.status, "需人工处理")
+        self.assertIn("支付页面网络连接失败", outcome.message)
+        self.assertIn("不要重复创建任务", outcome.message)
+        self.assertEqual(self.store.get_task(self.task_id)["status"], "需人工处理")
+
+    def test_recovers_alipay_network_error_by_reloading_payment_page_only(self) -> None:
+        self.store.authorize_task(self.task_id)
+        session = RecoveringPaymentSession()
+        runner = SingleAccountTaskRunner(self.store, FakeSessions(session))
+        outcome = runner.run(self.task_id, "target-1")
+        self.assertEqual(outcome.status, "待付款")
+        self.assertEqual(session.reload_count, 1)
+        self.assertEqual(self.store.get_task(self.task_id)["attempt_count"], 1)
 
     def test_cancelled_task_does_not_click(self) -> None:
         self.store.set_task_schedule(

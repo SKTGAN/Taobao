@@ -22,4 +22,5 @@ profiles/
 build/
 dist/
 *.exe
+*.egg-info/
 

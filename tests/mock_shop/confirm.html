@@ -4,17 +4,42 @@
   <meta charset="utf-8">
   <meta name="taobao-assistant-page" content="confirm_order">
   <title>确认订单</title>
+  <style>
+    #submitOrder { width: 560px; height: 220px; border: 1px solid #ddd; position: relative; }
+    #privacy-help { display: block; height: 150px; line-height: 150px; text-align: center; }
+    .SettlementSubmit { position: absolute; right: 12px; bottom: 12px; }
+    .submit-action { padding: 14px 36px; background: #ff5000; color: white; cursor: pointer; }
+    .submit-action.disabled { background: #aaa; }
+  </style>
 </head>
 <body>
   <h1>确认订单</h1>
   <p>模拟地址与价格已核对</p>
+  <div id="large-checkout-form"></div>
   <div id="checkout-host"></div>
   <script>
+    // Keep more than 800 generic controls ahead of the checkout action. This
+    // reproduces Taobao's large confirmation DOM and guards the preferred
+    // submit-container path in PAGE_SNAPSHOT_SCRIPT.
+    const largeForm = document.querySelector('#large-checkout-form');
+    for (let index = 0; index < 850; index += 1) {
+      const action = document.createElement('a');
+      action.href = '#';
+      action.textContent = `辅助选项 ${index}`;
+      largeForm.appendChild(action);
+    }
     const root = document.querySelector('#checkout-host').attachShadow({mode: 'open'});
-    root.innerHTML = '<button id="submit" disabled>提交订单</button>';
+    root.innerHTML = `
+      <div id="submitOrder">
+        <a id="privacy-help" href="/privacy.html" target="_blank">隐私号保护规则说明</a>
+        <div class="SettlementSubmit">
+          <div role="button" class="submit-action disabled" aria-disabled="true">立即支付 ￥0.01</div>
+        </div>
+      </div>`;
     setTimeout(() => {
-      const button = root.querySelector('#submit');
-      button.disabled = false;
+      const button = root.querySelector('.submit-action');
+      button.classList.remove('disabled');
+      button.setAttribute('aria-disabled', 'false');
       button.addEventListener('click', () => { window.open('/pending.html', '_blank'); });
     }, 500);
   </script>

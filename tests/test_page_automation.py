@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from src.page_automation import classify_page, has_enabled_action, product_precheck_finished
+from src.page_automation import (
+    build_click_action_script,
+    classify_page,
+    has_enabled_action,
+    product_precheck_finished,
+)
 
 
 class PageAutomationTests(unittest.TestCase):
@@ -98,6 +103,47 @@ class PageAutomationTests(unittest.TestCase):
             }
         )
         self.assertEqual(snapshot.kind, "pending_payment")
+
+    def test_classifies_tbapi_trade_payment_by_url(self) -> None:
+        snapshot = classify_page(
+            {
+                "url": "https://tbapi.alipay.com/trade/trade_payment.htm?sign=redacted",
+                "title": "",
+                "readyState": "loading",
+                "bodyText": "",
+                "controls": [],
+            }
+        )
+        self.assertEqual(snapshot.kind, "pending_payment")
+
+    def test_classifies_phone_privacy_rules_as_auxiliary(self) -> None:
+        snapshot = classify_page(
+            {
+                "url": "https://huodong.taobao.com/wow/z/mt/default/phone-privacy-1-0",
+                "title": "隐私号保护规则说明",
+                "readyState": "complete",
+                "bodyText": "服务介绍",
+                "controls": [],
+            }
+        )
+        self.assertEqual(snapshot.kind, "auxiliary")
+
+    def test_submit_script_never_clicks_the_whole_checkout_region(self) -> None:
+        script = build_click_action_script(("提交订单", "立即支付"))
+        self.assertNotIn("    '#submitOrder',", script)
+        self.assertIn("unsafe_submit_hit_target", script)
+
+    def test_classifies_alipay_chrome_network_error(self) -> None:
+        snapshot = classify_page(
+            {
+                "url": "chrome-error://chromewebdata/",
+                "title": "tbapi.alipay.com",
+                "readyState": "complete",
+                "bodyText": "无法访问此网站 tbapi.alipay.com 意外终止了连接 ERR_CONNECTION_CLOSED",
+                "controls": [],
+            }
+        )
+        self.assertEqual(snapshot.kind, "payment_error")
 
     def test_local_mock_marker_is_limited_to_localhost(self) -> None:
         local = classify_page(
