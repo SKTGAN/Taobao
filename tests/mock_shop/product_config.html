@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="taobao-assistant-page" content="product">
+  <title>模拟多规格商品</title>
+</head>
+<body>
+  <h1>模拟多规格商品</h1>
+  <section>
+    <h2>颜色</h2>
+    <button class="sku-item" onclick="this.dataset.selected='1'">黑色</button>
+    <button class="sku-item" onclick="this.dataset.selected='1'">白色</button>
+  </section>
+  <section>
+    <h2>容量</h2>
+    <button class="sku-item" onclick="this.dataset.selected='1'">256GB</button>
+    <button class="sku-item" onclick="this.dataset.selected='1'">512GB</button>
+  </section>
+  <label>数量 <input id="quantity" class="quantity-input" type="number" min="1" max="5" value="1"></label>
+  <button id="buy" onclick="window.open('/confirm_friend.html', '_blank')">立即购买</button>
+</body>
+</html>

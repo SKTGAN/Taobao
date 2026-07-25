@@ -8,6 +8,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 from src.app_config import AppConfig
 from src.safe_browser import BrowserLaunchError, find_google_chrome
@@ -22,6 +23,69 @@ class EnvironmentCheck:
     @property
     def passed(self) -> bool:
         return self.status == "通过"
+
+
+PROXY_ENVIRONMENT_VARIABLES = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+
+def detect_proxy_sources(
+    environ: Mapping[str, str] | None = None,
+    system_name: str | None = None,
+) -> tuple[str, ...]:
+    """Detect configured proxy sources without reading or exposing credentials."""
+    values = os.environ if environ is None else environ
+    sources = [name for name in PROXY_ENVIRONMENT_VARIABLES if str(values.get(name) or "").strip()]
+    if (system_name or platform.system()) == "Windows":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            ) as key:
+                try:
+                    proxy_enabled = int(winreg.QueryValueEx(key, "ProxyEnable")[0]) == 1
+                except OSError:
+                    proxy_enabled = False
+                try:
+                    proxy_server = str(winreg.QueryValueEx(key, "ProxyServer")[0] or "").strip()
+                except OSError:
+                    proxy_server = ""
+                try:
+                    auto_config = str(winreg.QueryValueEx(key, "AutoConfigURL")[0] or "").strip()
+                except OSError:
+                    auto_config = ""
+                if proxy_enabled and proxy_server:
+                    sources.append("Windows 系统代理")
+                if auto_config:
+                    sources.append("Windows 自动配置脚本")
+        except (ImportError, OSError, ValueError):
+            pass
+    return tuple(dict.fromkeys(sources))
+
+
+def proxy_environment_check() -> EnvironmentCheck:
+    sources = detect_proxy_sources()
+    if sources:
+        return EnvironmentCheck(
+            "代理/VPN提醒",
+            "警告",
+            "检测到代理配置来源："
+            + "、".join(sources)
+            + "。真实淘宝测试前请关闭代理/VPN并重新运行自检；TUN/隧道型VPN可能无法自动识别。",
+        )
+    return EnvironmentCheck(
+        "代理/VPN提醒",
+        "通过",
+        "未检测到常见系统或环境变量代理。TUN/隧道型VPN仍需由用户自行确认已关闭。",
+    )
 
 
 def _https_check(name: str, hostname: str, timeout: float = 5.0) -> EnvironmentCheck:
@@ -78,6 +142,8 @@ def run_environment_checks(config: AppConfig, data_dir: Path, include_network: b
         results.append(EnvironmentCheck("服务端口", "通过", f"已配置端口 {config.port}；冲突时启动脚本会自动换用空闲端口"))
     else:
         results.append(EnvironmentCheck("服务端口", "失败", "端口必须在 1024-65535 之间"))
+
+    results.append(proxy_environment_check())
 
     if include_network:
         results.extend(

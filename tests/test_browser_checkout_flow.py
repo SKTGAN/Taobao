@@ -13,7 +13,7 @@ from pathlib import Path
 
 from src.safe_browser import BrowserLaunchError, PersistentChromeSession, find_google_chrome
 from src.task_runner import SingleAccountTaskRunner
-from src.v2_store import V2Store
+from src.v2_store import TASK_MODE_FLASH, V2Store
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -114,6 +114,101 @@ class BrowserCheckoutFlowTests(unittest.TestCase):
                     any(str(page.get("url") or "").endswith("/privacy.html") for page in session._list_pages()),
                     "submit click opened the privacy-help page instead of the payment page",
                 )
+            finally:
+                server.shutdown()
+                server.server_close()
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_real_chrome_applies_specs_address_and_sends_mock_friend_pay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mock_dir = Path(__file__).parent / "mock_shop"
+            handler = partial(QuietHandler, directory=str(mock_dir))
+            server = QuietServer(("127.0.0.1", 0), handler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+
+            profile_dir = root / "chrome-profile"
+            profile_dir.mkdir()
+            product_url = f"http://127.0.0.1:{server.server_port}/product_config.html"
+            process = subprocess.Popen(
+                [
+                    str(find_google_chrome()),
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--disable-background-networking",
+                    "--no-first-run",
+                    f"--user-data-dir={profile_dir}",
+                    "--remote-debugging-port=0",
+                    "--remote-debugging-address=127.0.0.1",
+                    "--remote-allow-origins=http://127.0.0.1",
+                    product_url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 15
+                session = PersistentChromeSession(profile_dir)
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        self.fail("headless Chrome exited before DevTools became available")
+                    if (profile_dir / "DevToolsActivePort").exists() and session._adopt_running_session():
+                        break
+                    time.sleep(0.1)
+                else:
+                    self.fail("headless Chrome DevTools endpoint did not become available")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        if session.inspect_page().kind == "product":
+                            break
+                    except BrowserLaunchError:
+                        pass
+                    time.sleep(0.1)
+                else:
+                    self.fail("mock configurable product page did not become ready")
+                product_target_id = next(
+                    str(page.get("id") or "")
+                    for page in session._list_pages()
+                    if str(page.get("url") or "").endswith("/product_config.html")
+                )
+                self.assertTrue(session.click_product_option("黑色", product_target_id)["clicked"])
+                self.assertTrue(session.click_product_option("256GB", product_target_id)["clicked"])
+                self.assertEqual(
+                    session.set_product_quantity(3, product_target_id).get("value"),
+                    "3",
+                )
+
+                store = V2Store(root / "assistant.db")
+                account_id = store.add_account("浏览器代付测试账号")
+                product_id = store.add_product("模拟多规格商品", "https://item.taobao.com/item.htm?id=1")
+                task_id = store.add_task(
+                    "浏览器朋友代付流程测试",
+                    account_id,
+                    product_id,
+                    (datetime.now() - timedelta(seconds=1)).isoformat(timespec="milliseconds"),
+                    TASK_MODE_FLASH,
+                    "张三北京市朝阳区手机尾号9364",
+                    True,
+                    "13800138000",
+                )
+                store.authorize_task(task_id)
+                outcome = SingleAccountTaskRunner(store, FixedSessions(session)).run(
+                    task_id,
+                    product_target_id,
+                )
+                self.assertEqual(
+                    outcome.status,
+                    "代付待确认",
+                    f"{outcome.message}; pages={session._list_pages()}",
+                )
+                self.assertEqual(session.inspect_page(product_target_id).kind, "friend_pay_sent")
             finally:
                 server.shutdown()
                 server.server_close()

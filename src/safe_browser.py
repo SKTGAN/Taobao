@@ -15,15 +15,20 @@ from src.page_automation import (
     PAGE_SNAPSHOT_SCRIPT,
     PageSnapshot,
     build_click_action_script,
+    build_click_product_option_script,
+    build_fill_friend_pay_script,
+    build_select_address_script,
+    build_set_quantity_script,
     classify_page,
 )
-from src.product_urls import normalize_product_url
+from src.product_urls import normalize_product_url, product_id_from_url
 
 
 LOGIN_URL = "https://login.taobao.com/"
 ACCOUNT_HOME_URL = "https://i.taobao.com/my_taobao.htm"
 CART_URL = "https://cart.taobao.com/cart.htm"
 BOUGHT_ITEMS_URL = "https://buyertrade.taobao.com/trade/itemlist/list_bought_items.htm"
+ADDRESS_MANAGER_URL = "https://member1.taobao.com/member/fresh/deliver_address.htm"
 AUXILIARY_PAGE_TOKENS = (
     "phone-privacy",
     "privacy-rule",
@@ -41,6 +46,38 @@ def _is_auxiliary_page(url: str) -> bool:
     normalized = url.lower()
     return any(token in normalized for token in AUXILIARY_PAGE_TOKENS) and any(
         host in normalized for host in ("taobao.com", "tmall.com")
+    )
+
+
+def _is_task_transition_page(url: str) -> bool:
+    """Allow only checkout/security result tabs when opener metadata is missing."""
+    normalized = url.lower()
+    parsed = urllib.parse.urlparse(normalized)
+    host = parsed.hostname or ""
+    if host in {"127.0.0.1", "localhost"}:
+        return any(
+            token in parsed.path
+            for token in ("confirm", "pending", "friend", "login", "challenge")
+        )
+    if not any(host == domain or host.endswith(f".{domain}") for domain in ("taobao.com", "tmall.com", "alipay.com")):
+        return False
+    return any(
+        token in normalized
+        for token in (
+            "buy.",
+            "confirm_order",
+            "cashier",
+            "pay.taobao.com",
+            "excashier",
+            "trade_payment",
+            "peerpay",
+            "shenghuo.alipay.com/send/payment",
+            "friend",
+            "sec.",
+            "login.",
+            "verify",
+            "captcha",
+        )
     )
 
 
@@ -232,6 +269,7 @@ class PersistentChromeSession:
                 item
                 for item in pages
                 if str(item.get("id") or "") not in baseline_ids and item.get("id") != target_id
+                and _is_task_transition_page(str(item.get("url") or ""))
             ]
             candidate_map = {
                 str(item.get("id") or ""): item
@@ -259,6 +297,7 @@ class PersistentChromeSession:
             match = next((item for item in pages if item.get("id") == target_id), None)
             if match:
                 return match
+            raise BrowserLaunchError("任务绑定的 Chrome 标签页已关闭或失效，请重新准备商品。")
         candidates = [
             item
             for item in pages
@@ -321,7 +360,7 @@ class PersistentChromeSession:
             raise BrowserLaunchError("无法识别当前淘宝页面状态。")
         return classify_page(payload)
 
-    def click_action(self, labels: tuple[str, ...], target_id: str | None = None) -> dict:
+    def _click_script(self, expression: str, target_id: str | None = None) -> dict:
         target = self._page_target(target_id)
         websocket_url = str(target.get("webSocketDebuggerUrl") or "")
         try:
@@ -348,7 +387,7 @@ class PersistentChromeSession:
                 runtime_result = cdp_session.call(
                     "Runtime.evaluate",
                     {
-                        "expression": build_click_action_script(labels),
+                        "expression": expression,
                         "returnByValue": True,
                         "awaitPromise": True,
                         "userGesture": True,
@@ -362,6 +401,9 @@ class PersistentChromeSession:
                         "reason": str(result.get("reason") or "not_found")
                         if isinstance(result, dict)
                         else "not_found",
+                        "candidate_count": int(result.get("candidateCount") or 0)
+                        if isinstance(result, dict)
+                        else 0,
                     }
                 x = float(result["x"])
                 y = float(result["y"])
@@ -388,6 +430,27 @@ class PersistentChromeSession:
             raise BrowserLaunchError(f"无法向 Chrome 发送鼠标点击：{exc}") from exc
         return {"clicked": True, "text": str(result.get("text") or ""), "method": "cdp_mouse"}
 
+    def click_action(self, labels: tuple[str, ...], target_id: str | None = None) -> dict:
+        return self._click_script(build_click_action_script(labels), target_id)
+
+    def click_product_option(self, option_text: str, target_id: str | None = None) -> dict:
+        return self._click_script(build_click_product_option_script(option_text), target_id)
+
+    def set_product_quantity(self, quantity: int, target_id: str | None = None) -> dict:
+        result = self.evaluate(build_set_quantity_script(quantity), target_id)
+        if not isinstance(result, dict):
+            return {"changed": False, "reason": "invalid_quantity_result"}
+        return result
+
+    def select_checkout_address(self, keyword: str, target_id: str | None = None) -> dict:
+        return self._click_script(build_select_address_script(keyword), target_id)
+
+    def fill_friend_pay_account(self, account: str, target_id: str | None = None) -> dict:
+        result = self.evaluate(build_fill_friend_pay_script(account), target_id)
+        if not isinstance(result, dict):
+            return {"filled": False, "reason": "invalid_friend_account_result"}
+        return result
+
     def reload_page(self, target_id: str | None = None) -> None:
         """Reload the selected checkout/payment tab without submitting another order."""
         target = self._page_target(target_id)
@@ -404,6 +467,10 @@ class PersistentChromeSession:
     def open_bought_items(self) -> None:
         """Open Taobao orders as a safe fallback; never selects or pays an order."""
         self._open_target(BOUGHT_ITEMS_URL)
+
+    def open_address_manager(self) -> None:
+        """Open Taobao's official address manager; address entry stays manual."""
+        self._open_target(ADDRESS_MANAGER_URL)
 
     def open_login(self) -> None:
         self._open_target(LOGIN_URL)
@@ -432,6 +499,14 @@ class PersistentChromeSession:
 
     def open_product(self, url: str) -> str | None:
         normalized_url = normalize_product_url(url)
+        existing_ids: set[str] = set()
+        try:
+            if self._debug_is_available() or self._adopt_running_session():
+                existing_ids = {
+                    str(page.get("id") or "") for page in self._list_pages() if page.get("id")
+                }
+        except BrowserLaunchError:
+            existing_ids = set()
         target_id = self._open_target(normalized_url)
         if target_id:
             try:
@@ -442,21 +517,49 @@ class PersistentChromeSession:
                 self._target_baselines[target_id] = {target_id}
             return target_id
         deadline = time.monotonic() + 5
+        expected_product_id = product_id_from_url(normalized_url)
+        expected_parts = urllib.parse.urlparse(normalized_url)
         while time.monotonic() < deadline:
             try:
-                for page in self._list_pages():
+                pages = self._list_pages()
+                product_pages = []
+                direct_short_pages = []
+                for page in pages:
                     page_url = str(page.get("url") or "")
                     if page_url.startswith(("https://item.taobao.com/", "https://detail.tmall.com/")):
-                        found_target_id = str(page.get("id") or "") or None
-                        if found_target_id:
-                            self._target_baselines[found_target_id] = {
-                                str(item.get("id") or "") for item in self._list_pages() if item.get("id")
-                            }
-                        return found_target_id
-            except BrowserLaunchError:
-                pass
+                        if not expected_product_id or product_id_from_url(page_url) == expected_product_id:
+                            product_pages.append(page)
+                    parsed_page = urllib.parse.urlparse(page_url)
+                    if (
+                        not expected_product_id
+                        and parsed_page.hostname == expected_parts.hostname
+                        and parsed_page.path == expected_parts.path
+                    ):
+                        direct_short_pages.append(page)
+
+                candidates = product_pages if expected_product_id else direct_short_pages
+                if not candidates and not expected_product_id:
+                    candidates = [
+                        page
+                        for page in product_pages
+                        if str(page.get("id") or "") not in existing_ids
+                    ]
+                if not candidates and not expected_product_id and len(product_pages) == 1:
+                    candidates = product_pages
+                candidate_ids = {str(page.get("id") or "") for page in candidates if page.get("id")}
+                if len(candidate_ids) > 1:
+                    raise BrowserLaunchError("发现多个可能的商品标签页，无法安全绑定；请关闭无关商品页后重试。")
+                if len(candidate_ids) == 1:
+                    found_target_id = next(iter(candidate_ids))
+                    self._target_baselines[found_target_id] = {
+                        str(item.get("id") or "") for item in pages if item.get("id")
+                    }
+                    return found_target_id
+            except BrowserLaunchError as exc:
+                if "多个可能的商品标签页" in str(exc):
+                    raise
             time.sleep(0.1)
-        return None
+        raise BrowserLaunchError("未找到与当前商品链接匹配的 Chrome 标签页，请重新准备商品。")
 
     def navigate_product(self, url: str, target_id: str | None = None) -> str | None:
         """Navigate the prepared product tab to an exact product/SKU URL."""
@@ -500,4 +603,8 @@ class BrowserSessionManager:
 
     def close_all(self) -> None:
         self._sessions.clear()
+
+    def forget(self, account_id: int) -> None:
+        """Forget an account session without closing the user-controlled Chrome."""
+        self._sessions.pop(int(account_id), None)
 

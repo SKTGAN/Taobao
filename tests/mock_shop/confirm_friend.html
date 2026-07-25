@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="taobao-assistant-page" content="confirm_order">
+  <title>确认订单</title>
+</head>
+<body>
+  <h1>确认订单</h1>
+  <section>
+    <h2>收货地址</h2>
+    <label class="address-item"><input type="radio" name="address"> 张三 北京市朝阳区 手机尾号9364</label>
+    <label class="address-item"><input type="radio" name="address"> 李四 上海市浦东新区 手机尾号1234</label>
+  </section>
+  <section>
+    <label><input id="friend-option" type="checkbox">朋友代付</label>
+  </section>
+  <div id="submitOrder">
+    <div class="trade-buy-btn-submit">
+      <button id="submit-action" class="submit-action">免密支付 ¥1.00</button>
+    </div>
+  </div>
+  <script>
+    const option = document.querySelector('#friend-option');
+    const action = document.querySelector('#submit-action');
+    option.addEventListener('change', () => {
+      if (option.checked) {
+        action.textContent = '找朋友帮忙付';
+        action.onclick = () => window.open('/friend_pay.html', '_blank');
+      } else {
+        action.textContent = '免密支付 ¥1.00';
+        action.onclick = null;
+      }
+    });
+  </script>
+</body>
+</html>

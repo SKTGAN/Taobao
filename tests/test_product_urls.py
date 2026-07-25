@@ -68,6 +68,13 @@ class ProductUrlTests(unittest.TestCase):
             "https://m.tb.cn/h.test-token?tk=abc",
         )
 
+    def test_extracts_e_tb_short_link_from_share_text(self) -> None:
+        shared = "【淘宝】低价测试商品 https://e.tb.cn/h.test?tk=abc CZ057 点击链接打开"
+        self.assertEqual(
+            normalize_product_url(shared),
+            "https://e.tb.cn/h.test?tk=abc",
+        )
+
     def test_rejects_product_url_without_id(self) -> None:
         with self.assertRaisesRegex(ValueError, "商品 ID"):
             normalize_product_url("https://item.taobao.com/item.htm?abbucket=11")

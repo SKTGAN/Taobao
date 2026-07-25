@@ -3,9 +3,16 @@ from __future__ import annotations
 import unittest
 
 from src.page_automation import (
+    build_click_product_option_script,
+    build_fill_friend_pay_script,
+    build_select_address_script,
+    build_set_quantity_script,
     build_click_action_script,
     classify_page,
+    enabled_action_count,
     has_enabled_action,
+    has_unique_enabled_action,
+    parse_spec_terms,
     product_precheck_finished,
 )
 
@@ -129,9 +136,43 @@ class PageAutomationTests(unittest.TestCase):
         self.assertEqual(snapshot.kind, "auxiliary")
 
     def test_submit_script_never_clicks_the_whole_checkout_region(self) -> None:
-        script = build_click_action_script(("提交订单", "立即支付"))
+        script = build_click_action_script(("提交订单",))
         self.assertNotIn("    '#submitOrder',", script)
         self.assertIn("unsafe_submit_hit_target", script)
+        self.assertIn("ambiguous_action", script)
+
+    def test_multiple_enabled_actions_are_not_unique(self) -> None:
+        snapshot = classify_page(
+            {
+                "url": "https://item.taobao.com/item.htm?id=1",
+                "title": "测试商品",
+                "readyState": "complete",
+                "bodyText": "库存充足",
+                "controls": [
+                    {"text": "立即购买", "disabled": False},
+                    {"text": "立即购买", "disabled": False},
+                ],
+            }
+        )
+        self.assertEqual(enabled_action_count(snapshot, ("立即购买",)), 2)
+        self.assertTrue(has_enabled_action(snapshot, ("立即购买",)))
+        self.assertFalse(has_unique_enabled_action(snapshot, ("立即购买",)))
+
+    def test_exact_buy_button_ignores_combined_action_bar_wrapper(self) -> None:
+        snapshot = classify_page(
+            {
+                "url": "https://item.taobao.com/item.htm?id=1",
+                "title": "测试商品",
+                "readyState": "complete",
+                "bodyText": "库存充足",
+                "controls": [
+                    {"text": "加入购物车立即购买", "disabled": False},
+                    {"text": "立即购买", "disabled": False},
+                ],
+            }
+        )
+        self.assertEqual(enabled_action_count(snapshot, ("立即购买",)), 1)
+        self.assertTrue(has_unique_enabled_action(snapshot, ("立即购买",)))
 
     def test_classifies_alipay_chrome_network_error(self) -> None:
         snapshot = classify_page(
@@ -162,6 +203,40 @@ class PageAutomationTests(unittest.TestCase):
         )
         self.assertEqual(local.kind, "product")
         self.assertEqual(remote.kind, "unknown")
+
+    def test_parses_multiple_exact_specification_terms(self) -> None:
+        self.assertEqual(
+            parse_spec_terms(" 黑色 | 256GB； 官方标配\n黑色 "),
+            ("黑色", "256GB", "官方标配"),
+        )
+
+    def test_builds_scoped_configuration_scripts(self) -> None:
+        self.assertIn("ambiguous_option", build_click_product_option_script("黑色"))
+        self.assertIn("quantity_input_not_found", build_set_quantity_script(3))
+        self.assertIn("ambiguous_address", build_select_address_script("张三 9364"))
+        friend_script = build_fill_friend_pay_script("13800138000")
+        self.assertIn("friend_account_input_not_found", friend_script)
+        self.assertIn("13800138000", friend_script)
+
+    def test_classifies_friend_pay_request_and_success(self) -> None:
+        request_page = classify_page(
+            {
+                "url": "https://shenghuo.alipay.com/send/payment/fill.htm",
+                "title": "申请代付",
+                "bodyText": "好友的账户 支付宝账户 请他付款",
+                "controls": [{"text": "请他付款", "disabled": False}],
+            }
+        )
+        sent_page = classify_page(
+            {
+                "url": "https://shenghuo.alipay.com/send/payment/result.htm",
+                "title": "申请代付",
+                "bodyText": "代付申请已提交 已通知好友付款",
+                "controls": [],
+            }
+        )
+        self.assertEqual(request_page.kind, "friend_pay_request")
+        self.assertEqual(sent_page.kind, "friend_pay_sent")
 
 
 if __name__ == "__main__":

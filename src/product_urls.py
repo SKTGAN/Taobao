@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import re
 import urllib.parse
 
 
 PRODUCT_HOSTS = {"item.taobao.com", "detail.tmall.com"}
-SHORT_LINK_HOST = "m.tb.cn"
+SHORT_LINK_HOSTS = {"m.tb.cn", "e.tb.cn"}
+
+
+def _extract_shared_url(value: str) -> str:
+    """Extract the first HTTPS URL from a Taobao share message or plain URL."""
+    raw = str(value or "").strip()
+    match = re.search(r"https://[^\s]+", raw, flags=re.IGNORECASE)
+    if not match:
+        return raw
+    return match.group(0).rstrip("，。；;、）)]}〉》\"'")
 
 
 def _query_value(url: str, *names: str) -> str:
@@ -54,16 +64,16 @@ def resolve_product_selection(base_url: str, sku_or_url: str) -> str:
 
 def normalize_product_url(url: str) -> str:
     """Validate a product URL and retain only stable product/SKU identifiers."""
-    url = url.strip()
+    url = _extract_shared_url(url)
     parsed = urllib.parse.urlparse(url)
     host = (parsed.hostname or "").lower()
 
-    if parsed.scheme != "https" or host not in PRODUCT_HOSTS | {SHORT_LINK_HOST}:
-        raise ValueError("首版只接受淘宝、天猫或 m.tb.cn 商品链接")
+    if parsed.scheme != "https" or host not in PRODUCT_HOSTS | SHORT_LINK_HOSTS:
+        raise ValueError("首版只接受淘宝、天猫或 m.tb.cn/e.tb.cn 官方商品链接")
 
-    if host == SHORT_LINK_HOST:
+    if host in SHORT_LINK_HOSTS:
         if not parsed.path or parsed.path == "/":
-            raise ValueError("m.tb.cn 商品短链不完整")
+            raise ValueError("淘宝商品短链不完整")
         return urllib.parse.urlunparse(("https", host, parsed.path, "", parsed.query, ""))
 
     query = urllib.parse.parse_qs(parsed.query)

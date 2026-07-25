@@ -146,6 +146,49 @@ class DevToolsPortTests(unittest.TestCase):
                 self.assertEqual(session._page_target("product")["id"], "cashier")
 
     @patch("src.safe_browser.find_google_chrome", return_value=Path("chrome.exe"))
+    def test_unrelated_new_product_tab_is_not_adopted(self, _find_chrome) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = PersistentChromeSession(Path(temp_dir))
+            session._target_baselines["product"] = {"product"}
+            pages = [
+                {"id": "other", "type": "page", "url": "https://item.taobao.com/item.htm?id=2"},
+                {"id": "product", "type": "page", "url": "https://item.taobao.com/item.htm?id=1"},
+            ]
+            with patch.object(session, "_list_pages", return_value=pages):
+                self.assertEqual(session._page_target("product")["id"], "product")
+
+    @patch("src.safe_browser.find_google_chrome", return_value=Path("chrome.exe"))
+    def test_closed_bound_tab_does_not_fall_back_to_another_taobao_page(self, _find_chrome) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = PersistentChromeSession(Path(temp_dir))
+            session._target_baselines["closed"] = {"closed", "other"}
+            pages = [
+                {"id": "other", "type": "page", "url": "https://item.taobao.com/item.htm?id=2"},
+            ]
+            with patch.object(session, "_list_pages", return_value=pages):
+                with self.assertRaisesRegex(BrowserLaunchError, "标签页已关闭或失效"):
+                    session._page_target("closed")
+
+    @patch("src.safe_browser.find_google_chrome", return_value=Path("chrome.exe"))
+    def test_open_product_matches_expected_product_id(self, _find_chrome) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session = PersistentChromeSession(Path(temp_dir))
+            pages = [
+                {"id": "old", "type": "page", "url": "https://item.taobao.com/item.htm?id=2"},
+                {"id": "expected", "type": "page", "url": "https://item.taobao.com/item.htm?id=1"},
+            ]
+            with (
+                patch.object(session, "_debug_is_available", return_value=False),
+                patch.object(session, "_adopt_running_session", return_value=False),
+                patch.object(session, "_open_target", return_value=None),
+                patch.object(session, "_list_pages", return_value=pages),
+            ):
+                self.assertEqual(
+                    session.open_product("https://item.taobao.com/item.htm?id=1"),
+                    "expected",
+                )
+
+    @patch("src.safe_browser.find_google_chrome", return_value=Path("chrome.exe"))
     def test_click_brings_target_to_front_before_mouse_events(self, _find_chrome) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             session = PersistentChromeSession(Path(temp_dir))

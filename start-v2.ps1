@@ -1,6 +1,7 @@
 ﻿param(
     [int]$Port = 0,
-    [string]$ChromePath = ""
+    [string]$ChromePath = "",
+    [switch]$Restart
 )
 
 $ErrorActionPreference = "Stop"
@@ -84,7 +85,24 @@ $alreadyRunning = $false
 if ($null -ne $existing) {
     $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($existing.OwningProcess)" -ErrorAction SilentlyContinue
     if ($null -ne $owner -and [string]$owner.CommandLine -match "main\.py" -and [string]$owner.CommandLine -match "--port") {
-        $alreadyRunning = $true
+        if ($Restart) {
+            Write-Host "正在停止旧的淘宝助手服务进程 $($existing.OwningProcess)..." -ForegroundColor Yellow
+            Stop-Process -Id $existing.OwningProcess -Force
+            $released = $false
+            for ($i = 0; $i -lt 50; $i++) {
+                Start-Sleep -Milliseconds 100
+                if (-not (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)) {
+                    $released = $true
+                    break
+                }
+            }
+            if (-not $released) {
+                throw "旧服务停止后端口 $Port 仍未释放，请稍后重试。"
+            }
+        }
+        else {
+            $alreadyRunning = $true
+        }
     }
     else {
         $effectivePort = Get-FreeLocalPort
